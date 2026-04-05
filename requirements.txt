@@ -1,0 +1,25 @@
+# Core numerical + ML stack
+numpy>=1.24
+torch>=2.2
+sentence-transformers==5.1.2
+pandas
+
+# Manifold learning & neighbors
+umap-learn>=0.5.5
+scikit-learn>=1.3
+
+# Graphs & visualization
+networkx>=3.2
+matplotlib>=3.8
+
+# Progress bars, HTTP client
+tqdm>=4.66
+requests>=2.31
+
+# PDF text extraction for document_topic_discovery.py
+pdfminer.six>=20221105
+PyMuPDF
+
+# Optional: interactive 3D viewer for the causal manifold
+plotly>=5.24
+dash>=2.18
