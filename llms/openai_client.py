@@ -1,9 +1,15 @@
 # llms/openai_client.py
 
+import json
 import os
 from typing import List, Optional
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - exercised in CLIFF integration envs
+    requests = None
 
 
 class OpenAIChatClient:
@@ -77,14 +83,31 @@ class OpenAIChatClient:
             "temperature": self.temperature,
         }
 
-        resp = requests.post(
-            url,
-            json=payload,
-            headers=self._headers(),
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        if requests is not None:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        else:
+            request = Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=self._headers(),
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    charset = response.headers.get_content_charset() or "utf-8"
+                    data = json.loads(response.read().decode(charset, errors="replace"))
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"OpenAI chat completion request failed with status {exc.code}: {detail}"
+                ) from exc
         choices = data.get("choices", [])
         if not choices:
             return ""
