@@ -130,7 +130,11 @@ def main():
 
     print("[Module 4] Extracting relational triples…")
 
-    with INPUT_PATH.open("r") as f_in, OUTPUT_PATH.open("w") as f_out:
+    statements_seen = 0
+    triples_written = 0
+    progress_interval = 100
+
+    with INPUT_PATH.open("r", encoding="utf-8") as f_in, OUTPUT_PATH.open("w", encoding="utf-8", buffering=1) as f_out:
         for line in tqdm(f_in):
             obj = json.loads(line)
             topic = obj["topic"]
@@ -138,6 +142,7 @@ def main():
             question = obj["question"]
 
             for stmt in obj["statements"]:
+                statements_seen += 1
                 triple = extract_triple(stmt)
                 if triple is None:
                     continue
@@ -155,8 +160,20 @@ def main():
                     "domain": path_list[0],
                 }
                 f_out.write(json.dumps(out) + "\n")
+                f_out.flush()
+                triples_written += 1
 
-    print(f"[Module 4] COMPLETE. Saved → {OUTPUT_PATH}")
+                if triples_written % progress_interval == 0:
+                    print(
+                        f"[Module 4] Recovered {triples_written} triples from {statements_seen} statements so far…",
+                        flush=True,
+                    )
+
+    print(
+        f"[Module 4] COMPLETE. Saved → {OUTPUT_PATH} "
+        f"({triples_written} triples from {statements_seen} statements)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

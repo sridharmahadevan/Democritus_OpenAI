@@ -39,7 +39,7 @@ INPUT_PATH  = Path("causal_questions.jsonl")    # FROM MODULE 2
 OUTPUT_PATH = Path("causal_statements.jsonl")
 
 N_STMTS    = 2          # number of statements per question
-BATCH_SIZE = 16          # how many questions per LLM call
+BATCH_SIZE = 16         # how many questions per LLM call
 
 
 PROMPT_TEMPLATE = """
@@ -144,7 +144,11 @@ def main(
     output_path: Union[str, Path] = OUTPUT_PATH,
     shard_index: int = 0,
     num_shards: int = 1,
+    statements_per_question: int = N_STMTS,
+    batch_size: int = BATCH_SIZE,
 ):
+    statements_per_question = max(1, int(statements_per_question))
+    batch_size = max(1, int(batch_size))
     print("[Module 3] Loading causal questions…")
     records: List[Dict[str, Any]] = []
     input_path = Path(input_path)
@@ -179,17 +183,20 @@ def main(
     print(f"[Module 3] Found {len(records)} (topic, path, question) triples.")
 
     print("[Module 3] Loading LLM…")
-    llm = make_llm_client(max_tokens=192, max_batch_size=16)
+    llm = make_llm_client(
+        max_tokens=max(96, 96 * statements_per_question),
+        max_batch_size=max(16, batch_size),
+    )
 
     out_f = output_path.open("w")
     print("[Module 3] Generating REAL causal statements (batched)…")
 
     # Process in batches
-    for i in tqdm(range(0, len(records), BATCH_SIZE)):
-        batch = records[i : i + BATCH_SIZE]
+    for i in tqdm(range(0, len(records), batch_size)):
+        batch = records[i : i + batch_size]
 
         # Build prompts for this batch
-        prompts: List[str] = [build_prompt(rec["question"]) for rec in batch]
+        prompts: List[str] = [build_prompt(rec["question"], n=statements_per_question) for rec in batch]
 
         # Try batched generation first, then fall back to per-prompt calls
         # so one bad request does not kill the whole document run.
@@ -220,7 +227,7 @@ def main(
 
         # Parse and write outputs
         for rec, raw in zip(batch, raw_answers):
-            stmts = parse_statements(raw, n=N_STMTS)
+            stmts = parse_statements(raw, n=statements_per_question)
             if not stmts:
                 # If parsing fails catastrophically, you can either:
                 #  - skip, or
@@ -246,10 +253,14 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=str(OUTPUT_PATH))
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--statements-per-question", type=int, default=N_STMTS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     args = parser.parse_args()
     main(
         input_path=args.input,
         output_path=args.output,
         shard_index=args.shard_index,
         num_shards=args.num_shards,
+        statements_per_question=args.statements_per_question,
+        batch_size=args.batch_size,
     )

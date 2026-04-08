@@ -103,11 +103,28 @@ def main(
     max_total_topics: int = DEFAULT_MAX_TOTAL_TOPICS,
     topic_graph_path: str = DEFAULT_TOPIC_GRAPH_PATH,
     topic_list_path: str = DEFAULT_TOPIC_LIST_PATH,
+    shard_index: int = 0,
+    num_shards: int = 1,
 ):
     if topics_file is None:
         topics_file = DEFAULT_TOPICS_FILE
 
     root_topics = load_root_topics(topics_file)
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if not (0 <= shard_index < num_shards):
+        raise ValueError(f"shard_index must be in [0, {num_shards}), got {shard_index}")
+    if num_shards > 1:
+        root_topics = [topic for idx, topic in enumerate(root_topics) if idx % num_shards == shard_index]
+        print(
+            f"[Module 1] Processing shard {shard_index + 1}/{num_shards} "
+            f"with {len(root_topics)} root topics."
+        )
+        if not root_topics:
+            Path(topic_graph_path).write_text("", encoding="utf-8")
+            Path(topic_list_path).write_text("", encoding="utf-8")
+            print("[Module 1] No root topics assigned to this shard. Wrote empty outputs.")
+            return
 
     print("[Module 1] Loading Local LLM…")
     llm = make_llm_client()
@@ -211,6 +228,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-total-topics", type=int, default=DEFAULT_MAX_TOTAL_TOPICS)
     parser.add_argument("--topic-graph", type=str, default=DEFAULT_TOPIC_GRAPH_PATH)
     parser.add_argument("--topic-list", type=str, default=DEFAULT_TOPIC_LIST_PATH)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     args = parser.parse_args()
     main(
         topics_file=args.topics_file,
@@ -218,4 +237,6 @@ if __name__ == "__main__":
         max_total_topics=args.max_total_topics,
         topic_graph_path=args.topic_graph,
         topic_list_path=args.topic_list,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
     )
