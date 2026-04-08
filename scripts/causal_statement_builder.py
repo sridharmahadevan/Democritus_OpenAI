@@ -146,9 +146,11 @@ def main(
     num_shards: int = 1,
     statements_per_question: int = N_STMTS,
     batch_size: int = BATCH_SIZE,
+    max_tokens: int | None = None,
 ):
     statements_per_question = max(1, int(statements_per_question))
     batch_size = max(1, int(batch_size))
+    resolved_max_tokens = max(48, int(max_tokens)) if max_tokens is not None else max(96, 96 * statements_per_question)
     print("[Module 3] Loading causal questions…")
     records: List[Dict[str, Any]] = []
     input_path = Path(input_path)
@@ -184,8 +186,8 @@ def main(
 
     print("[Module 3] Loading LLM…")
     llm = make_llm_client(
-        max_tokens=max(96, 96 * statements_per_question),
-        max_batch_size=max(16, batch_size),
+        max_tokens=resolved_max_tokens,
+        max_batch_size=batch_size,
     )
 
     out_f = output_path.open("w")
@@ -255,6 +257,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--statements-per-question", type=int, default=N_STMTS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--max-tokens", type=int, default=None)
     args = parser.parse_args()
     main(
         input_path=args.input,
@@ -263,4 +266,5 @@ if __name__ == "__main__":
         num_shards=args.num_shards,
         statements_per_question=args.statements_per_question,
         batch_size=args.batch_size,
+        max_tokens=args.max_tokens,
     )
