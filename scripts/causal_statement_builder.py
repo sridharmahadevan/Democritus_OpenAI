@@ -26,7 +26,7 @@ Outputs:
 import json
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Optional, Union
 
 from tqdm import tqdm
 from llms.factory import make_llm_client
@@ -146,7 +146,7 @@ def main(
     num_shards: int = 1,
     statements_per_question: int = N_STMTS,
     batch_size: int = BATCH_SIZE,
-    max_tokens: int | None = None,
+    max_tokens: Optional[int] = None,
 ):
     statements_per_question = max(1, int(statements_per_question))
     batch_size = max(1, int(batch_size))
