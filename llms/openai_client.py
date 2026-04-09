@@ -67,6 +67,26 @@ class OpenAIChatClient:
             "Content-Type": "application/json",
         }
 
+    @staticmethod
+    def _extract_error_detail(response) -> str:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if message:
+                    return str(message)
+            message = payload.get("message")
+            if message:
+                return str(message)
+        detail = getattr(response, "text", "")
+        if detail:
+            return str(detail)
+        return "No response body returned."
+
     def _single_chat(self, prompt: str) -> str:
         """One call to /v1/chat/completions."""
         url = f"{self.base_url}/v1/chat/completions"
@@ -90,7 +110,14 @@ class OpenAIChatClient:
                 headers=self._headers(),
                 timeout=self.timeout,
             )
-            resp.raise_for_status()
+            status_code = getattr(resp, "status_code", 200)
+            if status_code >= 400:
+                detail = self._extract_error_detail(resp)
+                raise RuntimeError(
+                    "OpenAI chat completion request failed with "
+                    f"status {status_code} for model {self.model!r} "
+                    f"(prompt chars={len(prompt)}): {detail}"
+                )
             data = resp.json()
         else:
             request = Request(

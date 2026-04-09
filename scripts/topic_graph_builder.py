@@ -167,8 +167,33 @@ def main(
         # Build prompts for this batch
         prompts = [build_prompt(parent) for (parent, _) in batch_parents]
 
-        # Batched query to Qwen30B via vLLM
-        answers = llm.ask_batch(prompts)
+        # Try batched generation first, then fall back to single-topic calls
+        # so one bad request does not abort the whole document run.
+        try:
+            answers = llm.ask_batch(prompts)
+        except Exception as exc:
+            print(
+                "[Module 1] WARNING: batched LLM call failed for parents "
+                f"{[parent for parent, _ in batch_parents]}: {exc}"
+            )
+            answers = []
+            for parent, _ in batch_parents:
+                try:
+                    answers.append(llm.ask(build_prompt(parent)))
+                except Exception as single_exc:
+                    print(
+                        "[Module 1] WARNING: single-topic LLM call failed "
+                        f"for topic {parent!r}: {single_exc}"
+                    )
+                    answers.append("")
+
+        if len(answers) != len(batch_parents):
+            print(
+                f"[Module 1] WARNING: LLM returned {len(answers)} answers "
+                f"for {len(batch_parents)} prompts; padding the remainder as empty outputs."
+            )
+            answers = answers + [""] * max(0, len(batch_parents) - len(answers))
+            answers = answers[: len(batch_parents)]
 
         # Parse and integrate results
         for (parent, d), answer in zip(batch_parents, answers):
