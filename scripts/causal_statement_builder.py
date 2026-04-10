@@ -41,23 +41,82 @@ OUTPUT_PATH = Path("causal_statements.jsonl")
 N_STMTS    = 2          # number of statements per question
 BATCH_SIZE = 16         # how many questions per LLM call
 
+STATEMENT_TOKEN_STOPWORDS = {
+    "about",
+    "across",
+    "after",
+    "affects",
+    "because",
+    "between",
+    "causal",
+    "cause",
+    "causes",
+    "effects",
+    "from",
+    "given",
+    "increases",
+    "influences",
+    "leads",
+    "question",
+    "questions",
+    "reduces",
+    "statement",
+    "statements",
+    "that",
+    "their",
+    "them",
+    "this",
+    "those",
+    "which",
+    "with",
+    "write",
+}
+
+STATEMENT_META_TOKENS = {
+    "discovery",
+    "evidence",
+    "finding",
+    "findings",
+    "importance",
+    "implications",
+    "interpretation",
+    "knowledge",
+    "scientific",
+    "significance",
+    "theories",
+    "theory",
+    "timeline",
+    "timelines",
+    "understanding",
+}
+
 
 PROMPT_TEMPLATE = """
 You are a causal knowledge generator.
 
 Given the causal research question below, write EXACTLY {n} causal statements.
 
+Topic path:
+"{path}"
+
+Document causal guide:
+\"\"\"{document_guide}\"\"\"
+
 Each statement must:
 - be a declarative sentence,
 - describe a cause and an effect,
 - contain one of the words: causes, leads to, increases, reduces, affects, influences,
 - be scientifically meaningful.
+- stay close to the document's main causal story, mechanisms, actors, and outcomes.
+- prefer concrete entities or processes from the topic path and guide.
 
 Do NOT:
 - repeat or refer to these instructions,
 - describe a "format" or "example",
 - use bullets or numbering,
 - mention anything about questions or statements.
+- drift into meta claims about significance, scientific theories, understanding, or why a discovery matters unless that is the central causal claim of the document.
+- use vague subjects like "this discovery", "the finding", or "the evidence" when a concrete entity or mechanism is available.
 
 Write exactly {n} sentences, each on its own line.
 
@@ -66,8 +125,28 @@ Question:
 """.strip()
 
 
-def build_prompt(question: str, n: int = N_STMTS) -> str:
-    return PROMPT_TEMPLATE.format(n=n, question=question)
+def load_document_guide(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    guide_path = Path(path)
+    if not guide_path.exists():
+        return ""
+    try:
+        payload = json.loads(guide_path.read_text(encoding="utf-8"))
+    except Exception:
+        return guide_path.read_text(encoding="utf-8", errors="replace").strip()
+    if isinstance(payload, dict):
+        return str(payload.get("raw") or "").strip()
+    return str(payload).strip()
+
+
+def build_prompt(question: str, n: int = N_STMTS, path: Optional[List[str]] = None, document_guide: str = "") -> str:
+    return PROMPT_TEMPLATE.format(
+        n=n,
+        question=question,
+        path=" → ".join(path or []),
+        document_guide=document_guide,
+    )
 
 
 import re
@@ -103,7 +182,21 @@ def split_into_sentences(text: str):
         out.append(s)
     return out
 
-def parse_statements(raw: str, n: int = N_STMTS):
+
+def _statement_tokens(text: str):
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower())
+        if len(token) > 2 and token not in STATEMENT_TOKEN_STOPWORDS
+    }
+
+def parse_statements(
+    raw: str,
+    n: int = N_STMTS,
+    question: str = "",
+    path: Optional[List[str]] = None,
+    document_guide: str = "",
+):
     """
     1) Split raw LLM output into sentence-like chunks.
     2) Filter out obviously meta lines (instructions, notes, etc.).
@@ -113,6 +206,10 @@ def parse_statements(raw: str, n: int = N_STMTS):
     sentences = split_into_sentences(raw)
     candidates = []
     causal = []
+
+    anchor_tokens = _statement_tokens(question) | _statement_tokens(" ".join(path or []))
+    guide_tokens = _statement_tokens(document_guide)
+    meta_candidates = []
 
     for s in sentences:
         lower = s.lower()
@@ -130,10 +227,21 @@ def parse_statements(raw: str, n: int = N_STMTS):
         # Soft causal test: any keyword occurs anywhere
         if any(kw in lower for kw in CAUSAL_KEYWORDS):
             causal.append(s)
+        if _statement_tokens(s) & STATEMENT_META_TOKENS:
+            meta_candidates.append(s)
 
     # Prefer sentences with explicit causal language
     chosen = causal if causal else candidates
-    return chosen[:n]
+    ranked = sorted(
+        chosen,
+        key=lambda item: (
+            -len(_statement_tokens(item) & anchor_tokens),
+            -len(_statement_tokens(item) & guide_tokens),
+            sum(token in STATEMENT_META_TOKENS for token in _statement_tokens(item)),
+            len(item),
+        ),
+    )
+    return ranked[:n]
 
 # ---------------------------------------------------------------------
 # Main (batched)
@@ -142,6 +250,7 @@ def parse_statements(raw: str, n: int = N_STMTS):
 def main(
     input_path: Union[str, Path] = INPUT_PATH,
     output_path: Union[str, Path] = OUTPUT_PATH,
+    document_guide_path: Optional[str] = None,
     shard_index: int = 0,
     num_shards: int = 1,
     statements_per_question: int = N_STMTS,
@@ -155,6 +264,7 @@ def main(
     records: List[Dict[str, Any]] = []
     input_path = Path(input_path)
     output_path = Path(output_path)
+    document_guide = load_document_guide(document_guide_path)
     with input_path.open("r") as f_in:
         for line in f_in:
             line = line.strip()
@@ -199,6 +309,15 @@ def main(
 
         # Build prompts for this batch
         prompts: List[str] = [build_prompt(rec["question"], n=statements_per_question) for rec in batch]
+        prompts = [
+            build_prompt(
+                rec["question"],
+                n=statements_per_question,
+                path=rec["path"],
+                document_guide=document_guide,
+            )
+            for rec in batch
+        ]
 
         # Try batched generation first, then fall back to per-prompt calls
         # so one bad request does not kill the whole document run.
@@ -230,6 +349,13 @@ def main(
         # Parse and write outputs
         for rec, raw in zip(batch, raw_answers):
             stmts = parse_statements(raw, n=statements_per_question)
+            stmts = parse_statements(
+                raw,
+                n=statements_per_question,
+                question=rec["question"],
+                path=rec["path"],
+                document_guide=document_guide,
+            )
             if not stmts:
                 # If parsing fails catastrophically, you can either:
                 #  - skip, or
@@ -253,6 +379,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default=str(INPUT_PATH))
     parser.add_argument("--output", type=str, default=str(OUTPUT_PATH))
+    parser.add_argument("--document-guide", type=str, default=None)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--statements-per-question", type=int, default=N_STMTS)
@@ -262,6 +389,7 @@ if __name__ == "__main__":
     main(
         input_path=args.input,
         output_path=args.output,
+        document_guide_path=args.document_guide,
         shard_index=args.shard_index,
         num_shards=args.num_shards,
         statements_per_question=args.statements_per_question,

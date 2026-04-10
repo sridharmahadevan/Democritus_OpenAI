@@ -23,7 +23,8 @@ import json
 import argparse
 from pathlib import Path
 from collections import defaultdict
-from typing import List
+from typing import List, Optional
+import re
 
 from tqdm import tqdm
 from llms.factory import make_llm_client
@@ -37,6 +38,54 @@ OUTPUT_PATH = "causal_questions.jsonl"
 
 N_QUESTIONS_PER_TOPIC = 2
 BATCH_SIZE = 16  # how many topic paths per LLM call
+
+QUESTION_TOKEN_STOPWORDS = {
+    "about",
+    "across",
+    "after",
+    "among",
+    "because",
+    "between",
+    "cause",
+    "causes",
+    "effects",
+    "from",
+    "how",
+    "increases",
+    "influences",
+    "into",
+    "lead",
+    "leads",
+    "question",
+    "questions",
+    "reduces",
+    "that",
+    "them",
+    "this",
+    "those",
+    "what",
+    "which",
+    "while",
+    "with",
+    "would",
+}
+
+QUESTION_META_TOKENS = {
+    "discovery",
+    "evidence",
+    "finding",
+    "findings",
+    "importance",
+    "implications",
+    "interpretation",
+    "knowledge",
+    "significance",
+    "theories",
+    "theory",
+    "timeline",
+    "timelines",
+    "understanding",
+}
 
 
 # ---------------------------------------------------------------------
@@ -85,30 +134,67 @@ def build_paths(topics):
 # Prompt + parsing
 # ---------------------------------------------------------------------
 
-def build_prompt(path: List[str]) -> str:
+def load_document_guide(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    guide_path = Path(path)
+    if not guide_path.exists():
+        return ""
+    try:
+        payload = json.loads(guide_path.read_text(encoding="utf-8"))
+    except Exception:
+        return guide_path.read_text(encoding="utf-8", errors="replace").strip()
+    if isinstance(payload, dict):
+        return str(payload.get("raw") or "").strip()
+    return str(payload).strip()
+
+
+def build_prompt(path: List[str], document_guide: str = "") -> str:
     chain = " → ".join(path)
+    guide_block = ""
+    if document_guide:
+        guide_block = f"""
+Document causal guide:
+\"\"\"{document_guide}\"\"\"
+""".strip()
     return f"""
 Generate {N_QUESTIONS_PER_TOPIC} **distinct** causal questions about:
 
 {chain}
 
+{guide_block}
+
 Rules:
 - One question per line
 - Each question must contain a causal verb
   (causes, affects, influences, leads to, reduces, increases)
+- Keep the questions close to the document's main causal story, mechanisms, actors, and outcomes.
+- Prefer concrete causal questions about the entities or processes in the topic path.
+- Avoid meta questions about significance, understanding, scientific theories, or why a discovery matters unless that is the article's central causal claim.
+- Avoid vague subjects like "this discovery", "the finding", or "the evidence" when a concrete entity/mechanism is available.
 - No bullets, no numbering
 - No explanations, no commentary
 - Output exactly {N_QUESTIONS_PER_TOPIC} lines of questions
 """.strip()
 
 
-def parse_questions(text: str) -> List[str]:
+def _question_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower())
+        if len(token) > 2 and token not in QUESTION_TOKEN_STOPWORDS
+    }
+
+
+def parse_questions(text: str, path: Optional[List[str]] = None, document_guide: str = "") -> List[str]:
     """
     Robustly parse a block of text into up to N_QUESTIONS_PER_TOPIC
     well-formed causal questions.
     """
     lines = text.strip().split("\n")
     out = []
+    anchor_tokens = _question_tokens(" ".join(path or []))
+    guide_tokens = _question_tokens(document_guide)
     for L in lines:
         L = L.strip(" -•\t")
         if len(L) < 8:
@@ -116,9 +202,16 @@ def parse_questions(text: str) -> List[str]:
         if "note:" in L.lower():
             continue
         out.append(L)
-        if len(out) >= N_QUESTIONS_PER_TOPIC:
-            break
-    return out
+    ranked = sorted(
+        out,
+        key=lambda item: (
+            -len(_question_tokens(item) & anchor_tokens),
+            -len(_question_tokens(item) & guide_tokens),
+            sum(token in QUESTION_META_TOKENS for token in _question_tokens(item)),
+            len(item),
+        ),
+    )
+    return ranked[:N_QUESTIONS_PER_TOPIC]
 
 
 # ---------------------------------------------------------------------
@@ -128,6 +221,7 @@ def parse_questions(text: str) -> List[str]:
 def main(
     topic_graph_path: str = None,
     output_path: str = OUTPUT_PATH,
+    document_guide_path: Optional[str] = None,
     shard_index: int = 0,
     num_shards: int = 1,
 ):
@@ -140,6 +234,7 @@ def main(
 
     print("[Module 2] Reconstructing topic paths…")
     paths = build_paths(topics)  # dict: topic -> [root,...,topic]
+    document_guide = load_document_guide(document_guide_path)
 
     print("[Module 2] Loading LLM…")
     llm = make_llm_client(max_tokens=128, max_batch_size=16)
@@ -172,7 +267,7 @@ def main(
             for t in batch:
                 topic = t["topic"]
                 path = paths[topic]
-                prompts.append(build_prompt(path))
+                prompts.append(build_prompt(path, document_guide=document_guide))
                 batch_keys.append((topic, path))
 
             # Try batched generation first, then fall back to single-prompt calls
@@ -186,7 +281,7 @@ def main(
                 raw_answers = []
                 for topic, path in batch_keys:
                     try:
-                        raw_answers.append(llm.ask(build_prompt(path)))
+                        raw_answers.append(llm.ask(build_prompt(path, document_guide=document_guide)))
                     except Exception as single_exc:
                         print(
                             "[Module 2] WARNING: single-topic LLM call failed "
@@ -204,7 +299,7 @@ def main(
 
             # Parse & write out
             for (topic, path), raw in zip(batch_keys, raw_answers):
-                questions = parse_questions(raw)
+                questions = parse_questions(raw, path=path, document_guide=document_guide)
 
                 if not questions:
                     # If parsing fails badly, we can still fall back to raw text
@@ -233,12 +328,14 @@ if __name__ == "__main__":
         help="Path to topic_graph.jsonl",
     )
     parser.add_argument("--output", type=str, default=OUTPUT_PATH, help="Path to causal_questions.jsonl")
+    parser.add_argument("--document-guide", type=str, default=None, help="Optional path to document_topic_guide.json")
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     args = parser.parse_args()
     main(
         topic_graph_path=args.topic_graph,
         output_path=args.output,
+        document_guide_path=args.document_guide,
         shard_index=args.shard_index,
         num_shards=args.num_shards,
     )

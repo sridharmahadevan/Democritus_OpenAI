@@ -45,6 +45,7 @@ Outputs (inside outdir):
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
@@ -54,6 +55,124 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 Edge = Tuple[str, str, str]  # (src, dst, rel)
+
+_LEADING_PHRASE_PREFIXES = (
+    "the use of ",
+    "use of ",
+    "treatment with ",
+    "treatment using ",
+    "administration of ",
+    "exposure to ",
+    "the discovery of ",
+    "discovery of ",
+    "the presence of ",
+    "presence of ",
+    "an increase in ",
+    "increase in ",
+    "a rise in ",
+    "rise in ",
+    "the reduction of ",
+    "reduction of ",
+    "the loss of ",
+    "loss of ",
+    "the decline in ",
+    "decline in ",
+)
+
+_CLAUSE_MARKERS = (
+    ", which ",
+    " which ",
+    " by ",
+    " due to ",
+    " through ",
+    " allowing ",
+    " because ",
+    " while ",
+    " when ",
+)
+
+_TEXT_REWRITES: Tuple[Tuple[str, str], ...] = (
+    (r"\bglucagon[\s-]+like[\s-]+peptide[\s-]+1\b", "glp1"),
+    (r"\bglp[\s-]*1\b", "glp1"),
+    (r"\bglp1ras?\b", "glp1 receptor agonist"),
+    (r"\bglp1 receptor agonists\b", "glp1 receptor agonist"),
+    (r"\bindividuals\b", "people"),
+    (r"\bpatients\b", "people"),
+    (r"\bsubjects\b", "people"),
+    (r"\bpersons\b", "people"),
+    (r"\bmoving\b", "move"),
+    (r"\bmoves\b", "move"),
+)
+
+_TOKEN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "which",
+    "with",
+}
+
+_META_OBJECT_PREFIXES = (
+    "our knowledge about ",
+    "our knowledge of ",
+    "our understanding of ",
+    "the understanding of ",
+    "the significance of understanding ",
+    "the interpretation of ",
+    "scientific theories about ",
+    "scientific theories of ",
+    "the timeline of ",
+    "the evolutionary timeline of ",
+    "knowledge about ",
+    "knowledge of ",
+    "understanding of ",
+)
+
+_RELATION_FAMILIES = {
+    "leads_to": "causes",
+    "leads to": "causes",
+    "results_in": "causes",
+    "results in": "causes",
+    "drives": "causes",
+    "causes": "causes",
+    "cause": "causes",
+    "influences": "affects",
+    "influence": "affects",
+    "affects": "affects",
+    "affect": "affects",
+    "increases": "increases",
+    "increase": "increases",
+    "raises": "increases",
+    "raise": "increases",
+    "boosts": "increases",
+    "boost": "increases",
+    "reduces": "reduces",
+    "reduce": "reduces",
+    "decreases": "reduces",
+    "decrease": "reduces",
+    "lowers": "reduces",
+    "lower": "reduces",
+    "supports": "supports",
+    "support": "supports",
+    "enables": "supports",
+    "enable": "supports",
+    "facilitates": "supports",
+    "facilitate": "supports",
+}
 
 
 # ---------------------------
@@ -126,6 +245,137 @@ def load_triple_index(triples_path: Path, max_examples_per_edge: int = 3) -> Tup
     return counts, examples
 
 
+def normalize_relation_family(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    normalized = normalized.replace("-", "_")
+    return _RELATION_FAMILIES.get(normalized, normalized)
+
+
+def normalize_claim_surface(value: str, *, strip_meta_prefixes: bool = False) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    for marker in _CLAUSE_MARKERS:
+        if marker in text:
+            prefix, _, _ = text.partition(marker)
+            if prefix.strip():
+                text = prefix.strip()
+                break
+    text = text.replace("_", " ")
+    text = re.sub(r"[\-/]+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    for pattern, replacement in _TEXT_REWRITES:
+        text = re.sub(pattern, replacement, text)
+    text = re.sub(r"\s+", " ", text).strip()
+    changed = True
+    while changed and text:
+        changed = False
+        for prefix in _LEADING_PHRASE_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                changed = True
+    text = re.sub(r"^(?:the|a|an)\s+", "", text).strip()
+    if strip_meta_prefixes:
+        changed = True
+        while changed and text:
+            changed = False
+            for prefix in _META_OBJECT_PREFIXES:
+                if text.startswith(prefix):
+                    text = text[len(prefix):].strip()
+                    changed = True
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def claim_token_signature(value: str, *, strip_meta_prefixes: bool = False) -> Tuple[str, ...]:
+    normalized = normalize_claim_surface(value, strip_meta_prefixes=strip_meta_prefixes)
+    if not normalized:
+        return ()
+    tokens = [
+        token for token in normalized.split()
+        if token and token not in _TOKEN_STOPWORDS
+    ]
+    if not tokens:
+        return ()
+    return tuple(sorted(dict.fromkeys(tokens)))
+
+
+def jaccard(a: Tuple[str, ...], b: Tuple[str, ...]) -> float:
+    left = set(a)
+    right = set(b)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def quotient_claims_for_summary(claims_df: pd.DataFrame) -> pd.DataFrame:
+    if claims_df.empty:
+        return claims_df.copy()
+
+    rows = claims_df.reset_index(drop=True).copy()
+    rows["_canonical_rel"] = rows["rel"].apply(normalize_relation_family)
+    rows["_subj_sig"] = rows["src"].apply(claim_token_signature)
+    rows["_dst_sig"] = rows["dst"].apply(lambda value: claim_token_signature(value, strip_meta_prefixes=True))
+    rows["_summary_rank"] = list(range(len(rows)))
+
+    groups: List[List[int]] = []
+    for idx, row in rows.iterrows():
+        placed = False
+        for group in groups:
+            representative = rows.iloc[group[0]]
+            if row["_canonical_rel"] != representative["_canonical_rel"]:
+                continue
+            subj_overlap = jaccard(row["_subj_sig"], representative["_subj_sig"])
+            dst_overlap = jaccard(row["_dst_sig"], representative["_dst_sig"])
+            if subj_overlap >= 0.85 and dst_overlap >= 0.6:
+                group.append(idx)
+                placed = True
+                break
+            if subj_overlap >= 0.75 and dst_overlap >= 0.8:
+                group.append(idx)
+                placed = True
+                break
+        if not placed:
+            groups.append([idx])
+
+    kept_rows: List[dict] = []
+    for group in groups:
+        group_df = rows.iloc[group].copy()
+        representative = group_df.sort_values(
+            ["credibility", "support_count", "_summary_rank"],
+            ascending=[False, False, True],
+        ).iloc[0]
+        merged_examples: List[str] = []
+        for column in ("example_1", "example_2", "example_3"):
+            for value in group_df[column].tolist() if column in group_df.columns else []:
+                value = str(value or "").strip()
+                if value and value not in merged_examples:
+                    merged_examples.append(value)
+        row_dict = dict(representative)
+        row_dict["summary_variant_count"] = int(len(group_df))
+        row_dict["summary_equivalence_size"] = int(len(group_df))
+        row_dict["support_count"] = int(group_df["support_count"].max())
+        row_dict["models_supporting"] = "; ".join(
+            sorted(
+                {
+                    item.strip()
+                    for value in group_df["models_supporting"].tolist()
+                    for item in str(value or "").split(";")
+                    if item.strip()
+                }
+            )
+        )
+        for offset, value in enumerate(merged_examples[:3], start=1):
+            row_dict[f"example_{offset}"] = value
+        kept_rows.append(row_dict)
+
+    result = pd.DataFrame(kept_rows)
+    result = result.sort_values(
+        ["credibility", "support_count", "_summary_rank"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    return result.drop(columns=["_canonical_rel", "_subj_sig", "_dst_sig", "_summary_rank"], errors="ignore")
+
+
 def make_tier_block(df: pd.DataFrame, title: str, max_items: int) -> List[str]:
     lines: List[str] = []
     lines.append(f"## {title}")
@@ -142,6 +392,7 @@ def make_tier_block(df: pd.DataFrame, title: str, max_items: int) -> List[str]:
         dst = getattr(row, "dst")
         ex1 = getattr(row, "example_1") if "example_1" in df.columns else ""
         models = getattr(row, "models_supporting") if "models_supporting" in df.columns else ""
+        variant_count = int(getattr(row, "summary_equivalence_size", 1) or 1)
 
         lines.append(f"**{i}. ({cred:.2f}) {src} —{rel}→ {dst}**")
 
@@ -151,6 +402,8 @@ def make_tier_block(df: pd.DataFrame, title: str, max_items: int) -> List[str]:
 
         if isinstance(models, str) and models.strip():
             lines.append(f"- Supported by: {models}")
+        if variant_count > 1:
+            lines.append(f"- Consolidates {variant_count} nearby causal variants")
 
         lines.append("")
 
@@ -526,6 +779,9 @@ def main() -> None:
     tier1 = claims_df[claims_df["credibility"] >= t1].copy()
     tier2 = claims_df[(claims_df["credibility"] < t1) & (claims_df["credibility"] >= t2)].copy()
     tier3 = claims_df[claims_df["credibility"] < t2].copy()
+    tier1 = quotient_claims_for_summary(tier1)
+    tier2 = quotient_claims_for_summary(tier2)
+    tier3 = quotient_claims_for_summary(tier3)
     
     out_deep = None
     if args.write_deep_dive:
