@@ -97,6 +97,39 @@ def parse_subtopics(text: str):
     return uniq
 
 
+def _write_topic_outputs(
+    *,
+    depth: dict[str, int],
+    edges: list[tuple[str, str]],
+    topic_graph_path: str,
+    topic_list_path: str,
+) -> None:
+    out_graph = Path(topic_graph_path)
+    out_list = Path(topic_list_path)
+
+    print(f"[Module 1] Saving topic graph → {out_graph}")
+    with out_graph.open("w") as f:
+        for t, d in depth.items():
+            if d == 0:
+                f.write(json.dumps({"topic": t, "parent": None, "depth": d}) + "\n")
+        for t, d in depth.items():
+            if d == 0:
+                continue
+            parent = None
+            for (p, c) in edges:
+                if c == t:
+                    parent = p
+                    break
+            f.write(json.dumps({"topic": t, "parent": parent, "depth": d}) + "\n")
+
+    print(f"[Module 1] Saving topic list → {out_list}")
+    with out_list.open("w") as f:
+        for t, d in sorted(depth.items(), key=lambda x: x[1]):
+            f.write(f"{t}\t{d}\n")
+
+    print(f"[Module 1] Saved {out_graph} and {out_list}")
+
+
 def main(
     topics_file: str = None,
     depth_limit: int = DEFAULT_DEPTH_LIMIT,
@@ -127,7 +160,22 @@ def main(
             return
 
     print("[Module 1] Loading Local LLM…")
-    llm = make_llm_client()
+    try:
+        llm = make_llm_client()
+    except Exception as exc:
+        print(
+            "[Module 1] WARNING: failed to initialize LLM client for topic expansion; "
+            f"falling back to root-only topic graph. Reason: {exc}"
+        )
+        depth = {root: 0 for root in root_topics}
+        _write_topic_outputs(
+            depth=depth,
+            edges=[],
+            topic_graph_path=topic_graph_path,
+            topic_list_path=topic_list_path,
+        )
+        print("[Module 1] COMPLETE (root-only fallback).")
+        return
 
     depth: dict[str, int] = {}
     seen: set[str] = set()
@@ -215,34 +263,12 @@ def main(
 
     print(f"[Module 1] Total topics with depth: {len(depth)}")
 
-    out_graph = Path(topic_graph_path)
-    out_list  = Path(topic_list_path)
-
-    # Save topic_graph.jsonl
-    print(f"[Module 1] Saving topic graph → {out_graph}")
-    with out_graph.open("w") as f:
-        # roots
-        for t, d in depth.items():
-            if d == 0:
-                f.write(json.dumps({"topic": t, "parent": None, "depth": d}) + "\n")
-        # non-roots
-        for t, d in depth.items():
-            if d == 0:
-                continue
-            parent = None
-            for (p, c) in edges:
-                if c == t:
-                    parent = p
-                    break
-            f.write(json.dumps({"topic": t, "parent": parent, "depth": d}) + "\n")
-
-    # Save topic_list.txt
-    print(f"[Module 1] Saving topic list → {out_list}")
-    with out_list.open("w") as f:
-        for t, d in sorted(depth.items(), key=lambda x: x[1]):
-            f.write(f"{t}\t{d}\n")
-
-    print(f"[Module 1] Saved {out_graph} and {out_list}")
+    _write_topic_outputs(
+        depth=depth,
+        edges=edges,
+        topic_graph_path=topic_graph_path,
+        topic_list_path=topic_list_path,
+    )
     print("[Module 1] COMPLETE.")
 
 

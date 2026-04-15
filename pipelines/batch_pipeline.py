@@ -44,6 +44,13 @@ _STOPWORDS = {
     "before","such","most","some","many","any","all","each","other","new","one","two",
 }
 
+_GENERIC_TOPIC_TOKENS = {
+    "abstract","analysis","article","articles","author","authors","biorxiv","data",
+    "document","documents","effect","effects","finding","findings","impact","impacts",
+    "journal","manuscript","method","methods","paper","papers","preprint","result","results",
+    "review","reviews","study","studies","supplementary",
+}
+
 
 def auto_root_topics_from_text(text: str, n: int = 18) -> list[str]:
     """
@@ -58,24 +65,40 @@ def auto_root_topics_from_text(text: str, n: int = 18) -> list[str]:
     from collections import Counter
     freq = Counter(words)
 
-    # Prefer higher-frequency terms, avoid near-duplicates
-    terms = []
-    for w, _ in freq.most_common(200):
-        if w in terms:
+    filtered_words = [
+        w for w in words
+        if w not in _GENERIC_TOPIC_TOKENS and w not in ("figure","table","et","al","http","https","www","pdf")
+    ]
+    phrase_counts = Counter()
+    for size in (3, 2):
+        for idx in range(len(filtered_words) - size + 1):
+            phrase_tokens = filtered_words[idx: idx + size]
+            if any(token in _GENERIC_TOPIC_TOKENS for token in phrase_tokens):
+                continue
+            if any(freq.get(token, 0) < 2 for token in phrase_tokens):
+                continue
+            phrase_counts[" ".join(token.replace("-", " ") for token in phrase_tokens)] += 1
+
+    topics = []
+    seen = set()
+    for phrase, _count in sorted(phrase_counts.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0])):
+        if phrase in seen:
             continue
-        # avoid useless generic tokens
-        if w in ("figure","table","et","al","http","https","www","pdf"):
-            continue
-        terms.append(w)
-        if len(terms) >= n:
+        seen.add(phrase)
+        topics.append(phrase)
+        if len(topics) >= max(0, n - 2):
             break
 
-    # Convert into short noun-phrase-like topics
-    topics = []
-    for t in terms:
-        topics.append(t.replace("-", " ") + " impacts")
-    # Add a couple generic scaffolding topics
-    topics.append("association versus causation in the document")
+    if len(topics) < max(0, n - 2):
+        for w, _ in freq.most_common(200):
+            if w in seen or w in _GENERIC_TOPIC_TOKENS or w in ("figure","table","et","al","http","https","www","pdf"):
+                continue
+            topics.append(w.replace("-", " "))
+            seen.add(w)
+            if len(topics) >= max(0, n - 2):
+                break
+
+    topics.append("association versus causation")
     topics.append("key mechanisms and mediators")
     return topics[:n]
 

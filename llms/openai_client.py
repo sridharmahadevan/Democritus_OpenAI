@@ -2,7 +2,8 @@
 
 import json
 import os
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Union
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -10,6 +11,23 @@ try:
     import requests
 except ModuleNotFoundError:  # pragma: no cover - exercised in CLIFF integration envs
     requests = None
+
+try:
+    from CLIFF_CatAgi.functorflow_v3.llm_usage import (
+        append_llm_usage_row,
+        extract_openai_usage,
+        llm_usage_metadata_from_env,
+        llm_usage_path_from_env,
+    )
+except ImportError:  # pragma: no cover - standalone Democritus_OpenAI usage without CLIFF workspace
+    append_llm_usage_row = None
+    extract_openai_usage = None
+
+    def llm_usage_metadata_from_env() -> dict[str, object]:
+        return {}
+
+    def llm_usage_path_from_env() -> Path | None:
+        return None
 
 
 class OpenAIChatClient:
@@ -35,6 +53,8 @@ class OpenAIChatClient:
         temperature: Optional[float] = None,
         max_batch_size: Optional[int] = None,
         timeout: int = 120,
+        usage_log_path: Optional[Union[Path, str]] = None,
+        usage_metadata: Optional[dict[str, object]] = None,
     ) -> None:
         self.base_url = (
             base_url
@@ -58,6 +78,12 @@ class OpenAIChatClient:
         self.temperature = temperature or float(os.getenv("DEMOC_LLM_TEMPERATURE", "0.7"))
         self.max_batch_size = max_batch_size or int(os.getenv("DEMOC_LLM_BATCH_SIZE", "4"))
         self.timeout = timeout
+        self.usage_log_path = (
+            Path(usage_log_path).expanduser().resolve()
+            if usage_log_path is not None
+            else llm_usage_path_from_env()
+        )
+        self.usage_metadata = {**llm_usage_metadata_from_env(), **dict(usage_metadata or {})}
 
     # ---------------- internal helpers ----------------
 
@@ -86,6 +112,24 @@ class OpenAIChatClient:
         if detail:
             return str(detail)
         return "No response body returned."
+
+    def _record_usage(self, *, prompt: str, response_text: str, payload: dict[str, object]) -> None:
+        if append_llm_usage_row is None or extract_openai_usage is None:
+            return
+        usage = extract_openai_usage(payload)
+        append_llm_usage_row(
+            self.usage_log_path,
+            usage=usage,
+            metadata={
+                **self.usage_metadata,
+                "client": "Democritus_OpenAI.OpenAIChatClient",
+                "provider": "openai_compatible_chat",
+                "request_kind": "chat.completions",
+                "model": str(usage.get("model") or self.model),
+                "prompt_chars": len(prompt),
+                "response_chars": len(response_text),
+            },
+        )
 
     def _single_chat(self, prompt: str) -> str:
         """One call to /v1/chat/completions."""
@@ -139,7 +183,9 @@ class OpenAIChatClient:
         if not choices:
             return ""
         msg = choices[0].get("message", {})
-        return (msg.get("content") or "").strip()
+        response_text = (msg.get("content") or "").strip()
+        self._record_usage(prompt=prompt, response_text=response_text, payload=data)
+        return response_text
 
     # ---------------- public API ----------------
 
