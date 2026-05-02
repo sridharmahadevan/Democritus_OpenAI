@@ -15,18 +15,22 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in CLIFF integration
 try:
     from CLIFF_CatAgi.functorflow_v3.llm_usage import (
         append_llm_usage_row,
+        enforce_llm_token_budget,
         extract_openai_usage,
         llm_usage_metadata_from_env,
         llm_usage_path_from_env,
+        raise_if_over_llm_token_budget,
     )
 except ImportError:  # pragma: no cover - standalone Democritus_OpenAI usage without CLIFF workspace
     append_llm_usage_row = None
+    enforce_llm_token_budget = None
     extract_openai_usage = None
+    raise_if_over_llm_token_budget = None
 
     def llm_usage_metadata_from_env() -> dict[str, object]:
         return {}
 
-    def llm_usage_path_from_env() -> Path | None:
+    def llm_usage_path_from_env() -> Optional[Path]:
         return None
 
 
@@ -146,6 +150,15 @@ class OpenAIChatClient:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
+        if enforce_llm_token_budget is not None:
+            budget_status = enforce_llm_token_budget(
+                self.usage_log_path,
+                requested_completion_tokens=self.max_tokens,
+                prompt_chars=len(prompt),
+            )
+            allowed_completion_tokens = int(budget_status.get("allowed_completion_tokens") or 0)
+            if allowed_completion_tokens > 0:
+                payload["max_tokens"] = min(int(payload["max_tokens"]), allowed_completion_tokens)
 
         if requests is not None:
             resp = requests.post(
@@ -185,6 +198,8 @@ class OpenAIChatClient:
         msg = choices[0].get("message", {})
         response_text = (msg.get("content") or "").strip()
         self._record_usage(prompt=prompt, response_text=response_text, payload=data)
+        if raise_if_over_llm_token_budget is not None:
+            raise_if_over_llm_token_budget(self.usage_log_path)
         return response_text
 
     # ---------------- public API ----------------
